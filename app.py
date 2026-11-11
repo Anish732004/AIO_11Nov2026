@@ -448,20 +448,23 @@ with tab2:
     takeaway2.info(msg)
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Reorder point today", f"{ai_mc['rop']:,.0f} units",
-              help=f"Place an order when stock on hand + already on order falls to this level. AI forecast + "
-                   f"Monte Carlo, for an order placed on {last_day:%d %b %Y}.")
-    k2.metric("of which safety stock", f"{ai_mc['ss']:,.0f} units",
-              help="The buffer above expected demand during the lead time. It covers forecast errors and "
-                   "late deliveries.")
-    k3.metric("Classic method would say", f"{cl['rop']:,.0f} units",
-              delta=f"{cl['rop'] - ai_mc['rop']:+,.0f} vs AI", delta_color="off",
-              help="Textbook formula with a 28-day average and the raw spread of daily demand. It does not "
-                   "know about upcoming promotions.")
-    k4.metric("Formula's real protection", f"{formula_cover * 100:.1f} %",
-              delta=f"{(formula_cover - target) * 100:+.1f} pts vs target",
-              help="If you used the textbook formula (with AI inputs), this is the share of simulated scenarios "
-                   "it would really cover. Below target = it under-protects, usually because delays are skewed.")
+    diff = cl["rop"] - ai_mc["rop"]
+    k1.metric("Reorder when stock falls to", f"{ai_mc['rop']:,.0f} units",
+              help=f"The reorder point: place an order when stock on hand + already on order reaches this level. "
+                   f"Method: {METHODS['ai_mc']}, for an order placed on {last_day:%d %b %Y}.")
+    k2.metric("Safety buffer included", f"{ai_mc['ss']:,.0f} units",
+              help="The safety stock: the part of the reorder point above the demand expected during the "
+                   "delivery time. It absorbs forecast errors and late deliveries.")
+    k3.metric("Textbook method's reorder point", f"{cl['rop']:,.0f} units",
+              delta=f"{abs(diff):,.0f} units {'below' if diff < 0 else 'above'} the AI level", delta_color="off",
+              delta_arrow="off",          # the words say the direction; an inferred arrow contradicted them
+              help=f"{METHODS['classic']}: the formula with a 28-day average and the raw spread of daily demand. "
+                   "It does not know about upcoming promotions.")
+    k4.metric("Service the formula really delivers", f"{formula_cover * 100:.1f} %",
+              delta=f"{(formula_cover - target) * 100:+.1f} pts vs the {target * 100:.1f} % target",
+              help=f"{METHODS['ai_formula']}: the share of the 20,000 simulated scenarios its reorder point would "
+                   "really cover. Below target means it under-protects, usually because late deliveries are "
+                   "more likely than the formula assumes.")
 
     with st.expander("Show the math: the formula with today's numbers"):
         st.markdown(r"$SS = Z\cdot\sqrt{\sigma_D^2\cdot \bar L + \bar D^2\cdot\sigma_L^2}$,  "
@@ -510,9 +513,9 @@ with tab2:
                                       name="Simulated scenarios", showlegend=False,
                                       hovertemplate="%{x} units: %{y} scenarios<extra></extra>"))
         # vertical markers as legend entries (plain names + value) instead of crowded text labels
-        for x, label, color in [(d_ai * L_mean, "Average demand", GRAY),
-                                (ai_f["rop"], "Reorder point: AI + formula", AQUA),
-                                (ai_mc["rop"], "Reorder point: AI + Monte Carlo", ORANGE)]:
+        for x, label, color in [(d_ai * L_mean, "Expected demand during delivery", GRAY),
+                                (ai_f["rop"], f"Reorder point: {METHODS['ai_formula']}", AQUA),
+                                (ai_mc["rop"], f"Reorder point: {METHODS['ai_mc']}", ORANGE)]:
             hfig.add_trace(go.Scatter(x=[x, x], y=[0, top_y], mode="lines", line=dict(color=color, width=2.5),
                                       name=f"{label} ({x:,.0f})",
                                       hovertemplate=f"{label}: {x:,.0f} units<extra></extra>"))
@@ -539,7 +542,7 @@ with tab2:
                 "Achieved service is how often that would really have avoided a stockout, given the demand that "
                 "followed. The last column is the safety stock each method needs to truly hit the target.",
                 "the classic method under-delivers because it reacts to promotions only after they happen. "
-                "AI + Monte Carlo lands on target.")
+                f"{METHODS['ai_mc']} lands on target.")
     st.dataframe(summary.style.format({"Avg safety stock": "{:,.0f}", "Avg reorder point": "{:,.0f}",
                                        "Achieved service %": "{:.1f}",
                                        "Safety stock needed to truly hit target": "{:,.0f}"},
@@ -579,8 +582,8 @@ with tab2:
         kk = int(round(L_mean))
         act = [d_series[idx.get_loc(t) + 1: idx.get_loc(t) + 1 + kk].sum() for t in tl["origin"]]
         tfig = go.Figure([
-            line(tl["origin"], tl["rop_classic"], "Reorder point: Classic formula", GRAY),
-            line(tl["origin"], tl["rop_ai_mc"], "Reorder point: AI + Monte Carlo", ORANGE),
+            line(tl["origin"], tl["rop_classic"], f"Reorder point: {METHODS['classic']}", GRAY),
+            line(tl["origin"], tl["rop_ai_mc"], f"Reorder point: {METHODS['ai_mc']}", ORANGE),
             line(tl["origin"], act, f"Actual demand over the next {kk} days", BLUE, 1.5),
         ])
         style(tfig, "Units", 380)
@@ -657,7 +660,7 @@ with tab3:
         takeaway3.info(msg)
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Reorder point today", f"{r_today:,.0f} units",
+        k1.metric("Reorder when stock falls to", f"{r_today:,.0f} units",
                   help="Order when stock on hand + on order falls to this. Static: one fixed number. "
                        "AI dynamic: today's forecast of lead-time demand + k × its uncertainty.")
         k2.metric("Order quantity", f"{b_bo['Q']:,.0f} units",

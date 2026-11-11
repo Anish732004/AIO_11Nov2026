@@ -143,7 +143,8 @@ def dynamic_backtest(demand: pd.Series, bt: pd.DataFrame, L_fc: int, days, p, cs
     return pd.DataFrame(rows)
 
 
-METHODS = {"classic": "Classic formula", "ai_formula": "AI + formula", "ai_mc": "AI + Monte Carlo"}
+METHODS = {"classic": "Classic textbook", "ai_formula": "AI forecast + formula",
+           "ai_mc": "AI forecast + Monte Carlo"}
 
 
 def summarize(dyn: pd.DataFrame) -> pd.DataFrame:
