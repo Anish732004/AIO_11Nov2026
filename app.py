@@ -503,18 +503,24 @@ with tab2:
                     f"{target * 100:.1f} % of scenarios).",
                     "the long right tail comes from late deliveries. The formula assumes a symmetric bell curve, "
                     "so it sits too low. The bumps are whole-day lead times (4, 5, 6 days…).")
-        hfig = go.Figure(go.Histogram(x=ltd, nbinsx=80, marker_color=BLUE, opacity=0.85, name="Scenarios",
+        counts, edges = np.histogram(ltd, bins=60)
+        top_y = counts.max() * 1.05
+        hfig = go.Figure(go.Histogram(x=ltd, marker_color=BLUE, opacity=0.85,
+                                      xbins=dict(start=edges[0], end=edges[-1], size=edges[1] - edges[0]),
+                                      name="Simulated scenarios", showlegend=False,
                                       hovertemplate="%{x} units: %{y} scenarios<extra></extra>"))
-        mc_right = ai_mc["rop"] >= ai_f["rop"]
-        for x, label, color, y, side in [(d_ai * L_mean, "Expected", GRAY, 1.0, "left"),
-                                         (ai_f["rop"], "Formula ROP", AQUA, 0.84, "right" if mc_right else "left"),
-                                         (ai_mc["rop"], "Monte Carlo ROP", ORANGE, 1.0, "left" if mc_right else "right")]:
-            hfig.add_vline(x=x, line_color=color, line_width=2)
-            hfig.add_annotation(x=x, y=y, yref="paper", text=f"{label}<br>{x:,.0f}", showarrow=False,
-                                xanchor=side, yanchor="top", xshift=4 if side == "left" else -4,
-                                font=dict(size=11))   # no box: a fixed white box is unreadable in dark mode
-        hfig.update_layout(hovermode="closest", showlegend=False, bargap=0.05)
-        st.plotly_chart(style(hfig, "Scenarios", 320), width="stretch")
+        # vertical markers as legend entries (plain names + value) instead of crowded text labels
+        for x, label, color in [(d_ai * L_mean, "Average demand", GRAY),
+                                (ai_f["rop"], "Reorder point: AI + formula", AQUA),
+                                (ai_mc["rop"], "Reorder point: AI + Monte Carlo", ORANGE)]:
+            hfig.add_trace(go.Scatter(x=[x, x], y=[0, top_y], mode="lines", line=dict(color=color, width=2.5),
+                                      name=f"{label} ({x:,.0f})",
+                                      hovertemplate=f"{label}: {x:,.0f} units<extra></extra>"))
+        style(hfig, "Number of scenarios", 340)
+        hfig.update_layout(hovermode="closest", bargap=0.05,     # legend in the empty top-right corner
+                           legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.99))
+        hfig.update_xaxes(title="Units demanded before the delivery arrives")
+        st.plotly_chart(hfig, width="stretch")
     with c_right:
         chart_title("Delivery time",
                     "chance that a delivery takes each number of days. Set by the lead-time settings in the sidebar.",
@@ -523,8 +529,8 @@ with tab2:
         lfig = go.Figure(go.Bar(x=days, y=p * 100, marker_color=BLUE, name="Lead time",
                                 hovertemplate="%{x} days: %{y:.1f} %<extra></extra>"))
         lfig.update_layout(hovermode="closest", showlegend=False)
-        lfig.update_xaxes(title="Days", dtick=1 if days.max() <= 16 else 2)
-        st.plotly_chart(style(lfig, "Probability %", 320), width="stretch")
+        lfig.update_xaxes(title="Days until the delivery arrives", dtick=1 if days.max() <= 16 else 2)
+        st.plotly_chart(style(lfig, "Chance (%)", 340), width="stretch")
 
     # ---- honest check over the last 6 months
     st.markdown("#### Did it work? 6 months of daily decisions, checked against real demand")
@@ -573,11 +579,13 @@ with tab2:
         kk = int(round(L_mean))
         act = [d_series[idx.get_loc(t) + 1: idx.get_loc(t) + 1 + kk].sum() for t in tl["origin"]]
         tfig = go.Figure([
-            line(tl["origin"], act, f"Actual {kk}-day demand", BLUE, 1.5),
-            line(tl["origin"], tl["rop_classic"], "Classic", GRAY),
-            line(tl["origin"], tl["rop_ai_mc"], "AI + Monte Carlo", ORANGE),
+            line(tl["origin"], tl["rop_classic"], "Reorder point: Classic formula", GRAY),
+            line(tl["origin"], tl["rop_ai_mc"], "Reorder point: AI + Monte Carlo", ORANGE),
+            line(tl["origin"], act, f"Actual demand over the next {kk} days", BLUE, 1.5),
         ])
-        st.plotly_chart(style(tfig, "Units", 360), width="stretch")
+        style(tfig, "Units", 380)
+        tfig.update_layout(margin=dict(t=64))                 # room for a two-row legend
+        st.plotly_chart(tfig, width="stretch")
     st.caption("**Next → tab ③:** we fixed the service level here. What if we let costs decide both when and "
                "how much to order?")
 
