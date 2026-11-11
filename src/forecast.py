@@ -57,9 +57,9 @@ def build_features(df: pd.DataFrame, L: int) -> pd.DataFrame:
 
     nxt = df["date"] + pd.Timedelta(days=1)
     mid = df["date"] + pd.Timedelta(days=(L + 1) / 2)
-    f["dow_next"] = nxt.dt.dayofweek
-    f["doy_sin"] = np.sin(2 * np.pi * mid.dt.dayofyear / 365.25)
-    f["doy_cos"] = np.cos(2 * np.pi * mid.dt.dayofyear / 365.25)
+    f["dow_next"] = nxt.dt.day_of_week
+    f["doy_sin"] = np.sin(2 * np.pi * mid.dt.day_of_year / 365.25)
+    f["doy_cos"] = np.cos(2 * np.pi * mid.dt.day_of_year / 365.25)
     f["holidays_in_window"] = _fwd_sum(df["holiday"], L)
 
     f["promo_days_in_window"] = _fwd_sum(df["promo"], L)

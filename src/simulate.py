@@ -86,11 +86,11 @@ def generate_world(cfg: SimConfig = SimConfig(), history_days: int = 3 * 365,
     rng = np.random.default_rng(cfg.seed)
     dates = pd.date_range(start, periods=n, freq="D")
     t = np.arange(n)
-    doy = dates.dayofyear.to_numpy()
+    doy = dates.day_of_year.to_numpy()
 
     trend = 1 + cfg.trend_per_year * t / 365.25
     annual = 1 + cfg.annual_amp * np.cos(2 * np.pi * (doy - cfg.annual_peak_doy) / 365.25)
-    weekly = np.asarray(cfg.weekly)[dates.dayofweek.to_numpy()]
+    weekly = np.asarray(cfg.weekly)[dates.day_of_week.to_numpy()]
 
     ar = np.zeros(n)
     shocks = rng.normal(0, cfg.temp_ar_sd, n)

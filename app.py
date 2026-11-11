@@ -7,11 +7,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-from src.data_io import REQUIRED_UPLOAD, validate_new_rows
 from scipy.stats import norm
 
-from src.forecast import ALL_GROUPS, MODELS, forecast_next, metrics, walk_forward
+from src.data_io import REQUIRED_UPLOAD, validate_new_rows
+from src.forecast import ALL_GROUPS, FEATURE_GROUPS, MODELS, forecast_next, metrics, walk_forward
 from src.optimize import Costs, Problem, bayes_opt, best_feasible, best_so_far, grid_search, lead_scenarios
 from src.safety_stock import (METHODS, ai_inputs, analytic, classic_inputs, dynamic_backtest,
                               lead_time_pmf, monte_carlo, pmf_moments, simulate_ltd, summarize)
@@ -23,6 +22,17 @@ HISTORY_DAYS, FUTURE_DAYS = 3 * 365, 365
 MAX_REVEAL = FUTURE_DAYS - 30
 # Categorical slots in fixed order (validated palette); gray = baseline / de-emphasised.
 BLUE, ORANGE, AQUA, GRAY = "#2a78d6", "#eb6834", "#1baf7a", "#898781"
+
+FEATURE_LABELS = {
+    "lag0_rel": "Yesterday's demand", "lag6_rel": "Demand a week ago", "rm7_rel": "Last 7-day average",
+    "lastL_rel": "Last lead-time total", "momentum": "Recent trend", "dow_next": "Weekday the window starts",
+    "doy_sin": "Time of year", "doy_cos": "Time of year", "holidays_in_window": "Holidays ahead",
+    "promo_days_in_window": "Promotion days ahead", "discount_sum_in_window": "Planned discounts ahead",
+    "promo_days_prev7": "Recent promotions", "temp_fcst_in_window": "Weather forecast",
+}
+GROUP_OF = {f: g for g, fs in FEATURE_GROUPS.items() for f in fs}
+GROUP_LABELS = {"lags": "recent demand", "calendar": "the calendar", "promo": "planned promotions",
+                "external": "the weather forecast"}
 
 
 # ---------------------------------------------------------------- data & models (cached)
@@ -75,11 +85,11 @@ def next_forecast(df_plan: pd.DataFrame, L: int, kind: str, bt: pd.DataFrame) ->
 
 
 def observed(w: pd.DataFrame, n: int, overrides: pd.DataFrame) -> pd.DataFrame:
+    """World history up to the released day, with uploaded rows replacing the simulated ones by date."""
     obs = w.iloc[:HISTORY_DAYS + n][DATA_COLUMNS].copy()
     if len(overrides):
-        obs = obs.set_index("date")
-        obs.update(overrides.set_index("date")[[c for c in DATA_COLUMNS if c != "date"]])
-        obs = obs.reset_index()
+        ov = overrides[DATA_COLUMNS].astype(obs.dtypes.to_dict())   # uploaded rows start as generic objects
+        obs = pd.concat([obs[~obs["date"].isin(ov["date"])], ov]).sort_values("date").reset_index(drop=True)
     return obs
 
 
@@ -90,18 +100,32 @@ def with_plan(w: pd.DataFrame, obs: pd.DataFrame, L: int) -> pd.DataFrame:
     return pd.concat([obs, plan], ignore_index=True)
 
 
-# ---------------------------------------------------------------- chart helpers
-def style(fig: go.Figure, title: str, ytitle: str, height: int = 340) -> go.Figure:
-    fig.update_layout(title=dict(text=title, x=0, font=dict(size=15)), height=height,
-                      margin=dict(l=8, r=8, t=56, b=8), hovermode="x unified",
+# ---------------------------------------------------------------- UI helpers
+def style(fig: go.Figure, ytitle: str, height: int = 340) -> go.Figure:
+    """Chart chrome. Titles live outside the chart (chart_title) so they can carry a '?' help icon."""
+    fig.update_layout(height=height, margin=dict(l=8, r=8, t=28, b=8), hovermode="x unified",
                       legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, title=None))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(title=ytitle, zeroline=False)
     return fig
 
 
+def chart_title(title: str, read: str, notice: str):
+    st.markdown(f"**{title}**", help=f"**How to read it:** {read}\n\n**What to notice:** {notice}")
+
+
 def line(x, y, name, color, width=2.0, **kw):
     return go.Scatter(x=x, y=y, name=name, mode="lines", line=dict(color=color, width=width), **kw)
+
+
+def tab_settings_box():
+    box = st.container(border=True)
+    box.markdown("⚙️ **Settings for this tab only**")
+    return box
+
+
+def using_sidebar(*items: str):
+    st.caption("Using sidebar settings: " + " · ".join(items) + ". Change them in the sidebar.")
 
 
 # ---------------------------------------------------------------- session state
@@ -121,24 +145,38 @@ def reveal(k: int):
     ss.n = min(ss.n + k, MAX_REVEAL)
 
 
-# ---------------------------------------------------------------- sidebar
+# ---------------------------------------------------------------- sidebar (global settings)
 with st.sidebar:
-    st.header("Scenario")
-    seed = st.number_input("Simulation seed", 1, 9999, 7, help="A different seed = a different synthetic world.",
-                           on_change=reset)
-    L = st.slider("Average lead time L (days)", 3, 14, 5,
-                  help="We forecast total demand over the next L days: the demand a reorder must cover.")
-    sigma_L_in = st.slider("Lead-time variability σL (days)", 0.0, 4.0, 1.5, 0.5,
-                           help="Standard deviation of supplier lead time.")
-    shape_label = st.radio("Lead-time shape", ["Right-skewed (delays)", "Normal"], horizontal=True,
-                           help="Real suppliers are late more often than early. The formula assumes normal.")
-    shape = "skewed" if shape_label.startswith("Right") else "normal"
-    model_name = st.radio("Forecast model", list(MODELS), index=1, horizontal=True)
+    st.markdown("### Global settings")
+    st.caption("Everything here applies to **all three tabs**. Each tab also has its own boxed settings.")
+
+    st.markdown("**🌍 Simulated world**")
+    seed = st.number_input("World number", 1, 9999, 7, on_change=reset,
+                           help="Each number creates a different 3-year demand history with the same rules. "
+                                "Use it to check that the conclusions hold in other worlds. Affects all tabs.")
+
+    st.markdown("**🔮 Forecast model**")
+    model_name = st.radio("Model", list(MODELS), index=1, horizontal=True, label_visibility="collapsed",
+                          help="Both are tree-based machine-learning models. The forecast feeds the safety "
+                               "stock (tab 2) and the optimization (tab 3). Affects all tabs.")
     kind = MODELS[model_name]
 
+    st.markdown("**🚚 Supplier lead time**")
+    L = st.slider("Average lead time (days)", 3, 14, 5,
+                  help="How long a delivery takes on average. The model forecasts demand over this many days, "
+                       "because that is what an order must cover. Affects all tabs.")
+    sigma_L_in = st.slider("Lead-time variability (± days)", 0.0, 4.0, 1.5, 0.5,
+                           help="Standard deviation of delivery time. 0 = the supplier is always on time. "
+                                "Affects tabs 2 and 3.")
+    shape_label = st.radio("Delays pattern", ["Right-skewed (delays)", "Normal"], horizontal=True,
+                           help="Real suppliers are late more often than early (right-skewed). The textbook "
+                                "formula assumes a symmetric bell curve (normal). Affects tabs 2 and 3.")
+    shape = "skewed" if shape_label.startswith("Right") else "normal"
+
     st.divider()
-    st.header("New data feed")
-    st.caption("Release the next days of the simulated world. The model retrains on everything it has seen.")
+    st.markdown("**📥 New data**")
+    st.caption("Release the next days of the simulated world. The model retrains on everything it has seen, "
+               "and every tab updates.")
     c1, c2, c3 = st.columns(3)
     c1.button("+1 d", on_click=reveal, args=(1,), width="stretch", help="Release 1 more day")
     c2.button("+7 d", on_click=reveal, args=(7,), width="stretch", help="Release 7 more days")
@@ -168,13 +206,22 @@ with st.sidebar:
 
 obs = observed(w, ss.n, ss.overrides)
 last_day = obs["date"].iloc[-1]
+lead_desc = f"lead time {L} ± {sigma_L_in:g} days ({'skewed' if shape == 'skewed' else 'normal'})"
 
-# ---------------------------------------------------------------- header
+# ---------------------------------------------------------------- header + guide
 st.title("Reorder Point Lab")
-st.caption("Predict lead-time demand with machine learning, size safety stock from the forecast's own errors, "
-           "and let Bayesian optimization choose the reorder point.")
+st.caption("When should a store reorder, and how much? Three steps, one per tab. Work through them left to right.")
+g1, g2, g3 = st.columns(3)
+g1.container(border=True).markdown("**① Forecast demand**  \nPredict how much will sell while a delivery is "
+                                   "on its way, including promotions and seasons.")
+g2.container(border=True).markdown("**② Size the safety stock**  \nTurn the forecast's uncertainty into a "
+                                   "buffer that really hits a service target.")
+g3.container(border=True).markdown("**③ Optimize the policy**  \nLet Bayesian optimization pick when and how "
+                                   "much to order at the lowest cost.")
+st.caption("ⓘ Sidebar settings change every tab. Settings in a ⚙️ box inside a tab change only that tab. "
+           "Hover the ? icons for how to read each chart.")
 
-tab1, tab2, tab3 = st.tabs(["1 · Demand forecasting", "2 · Dynamic safety stock", "3 · Reorder-point optimization"])
+tab1, tab2, tab3 = st.tabs(["① Forecast demand", "② Safety stock", "③ Optimize reorder policy"])
 
 # ================================================================= TAB 1
 with tab1:
@@ -185,25 +232,43 @@ with tab1:
     bt_other = backtest(obs, L, "rf" if kind == "gb" else "gb", test_days=364).tail(182)
     fc = next_forecast(with_plan(w, obs, L), L, kind, bt_full)
 
-    # forecast log: every forecast made at an origin, scored once its window has happened
     log = ss.log.setdefault(f"{seed}-{L}-{kind}", {})
     log.setdefault(fc["origin"], (fc["point"], fc["low"], fc["high"]))
 
     m_model = metrics(bt["actual"], bt["forecast"])
     m_ma = metrics(bt["actual"], bt["moving_avg"])
     win = f"{(last_day + pd.Timedelta(days=1)):%d %b} – {(last_day + pd.Timedelta(days=L)):%d %b %Y}"
+    imp = fc["importances"].groupby(lambda f: FEATURE_LABELS[f]).sum().sort_values(ascending=False)
+    top_group = GROUP_LABELS[GROUP_OF[fc["importances"].index[0]]]
+
+    st.markdown(f"#### How much will sell in the next {L} days?")
+    using_sidebar(f"world {seed}", model_name, f"{L}-day lead time", f"data up to {last_day:%d %b %Y}")
+    st.info(f"**Key takeaway:** the {model_name} forecast is off by **{m_model['WAPE %']:.1f} %** on average, "
+            f"against **{m_ma['WAPE %']:.1f} %** for a simple 28-day average: "
+            f"{m_ma['WAPE %'] / m_model['WAPE %']:.1f}× more accurate. It leans most on **{top_group}**, "
+            "which a moving average cannot see coming.")
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric(f"Forecast demand, next {L} days", f"{fc['point']:,.0f} units",
-              help=f"Window {win}. Range is the 80 % interval from back-test errors.")
-    k1.caption(f"{win} · 80 % range {fc['low']:,.0f}–{fc['high']:,.0f}")
-    k2.metric(f"{model_name} error (WAPE)", f"{m_model['WAPE %']:.1f} %",
-              delta=f"{m_model['WAPE %'] - m_ma['WAPE %']:+.1f} pts vs moving average", delta_color="inverse")
-    k3.metric("Moving-average baseline (WAPE)", f"{m_ma['WAPE %']:.1f} %")
-    k4.metric("Days of data", f"{len(obs):,}", delta=f"+{ss.n} new" if ss.n else None)
+    k1.metric(f"Forecast, next {L} days", f"{fc['point']:,.0f} units",
+              help=f"Total demand expected from {win}. 80 % of the time the actual should fall within "
+                   f"{fc['low']:,.0f}–{fc['high']:,.0f} units (range taken from the model's past errors).")
+    k1.caption(f"{win} · likely {fc['low']:,.0f}–{fc['high']:,.0f}")
+    k2.metric(f"{model_name} error", f"{m_model['WAPE %']:.1f} %",
+              delta=f"{m_model['WAPE %'] - m_ma['WAPE %']:+.1f} pts vs simple average", delta_color="inverse",
+              help="WAPE: total forecast error ÷ total demand, over the last 6 months of forecasts the model "
+                   "had never seen. Lower is better.")
+    k3.metric("Simple 28-day average error", f"{m_ma['WAPE %']:.1f} %",
+              help="The baseline: assume the next days look like the average of the last 28. "
+                   "A model is only worth using if it clearly beats this.")
+    k4.metric("Days of history", f"{len(obs):,}", delta=f"+{ss.n} new" if ss.n else None,
+              help="Days the model learns from. Grows when you release new data in the sidebar.")
 
     # ---- data
-    st.subheader("The data")
+    chart_title("Daily demand",
+                "the blue line is units sold per day. Orange dots are promotion days, green diamonds are "
+                "holidays. Drag the slider under the chart to see all three years.",
+                "spikes line up with promotions and holidays, demand climbs into the festive season "
+                "(Oct–Nov), and the whole series grows year on year. These are the patterns the model learns.")
     view = obs.copy()
     fig = go.Figure()
     fig.add_trace(line(view["date"], view["demand"], "Daily demand", BLUE, 1.4))
@@ -219,82 +284,100 @@ with tab1:
         fig.add_vrect(x0=w["date"].iloc[HISTORY_DAYS], x1=last_day, fillcolor=GRAY, opacity=0.12, line_width=0,
                       annotation_text="new data", annotation_position="top left")
     fig.update_xaxes(range=[last_day - pd.Timedelta(days=365), last_day], rangeslider=dict(visible=True, thickness=0.06))
-    st.plotly_chart(style(fig, "Daily demand (drag the slider below to see all history)", "Units / day", 380),
-                    width="stretch")
+    st.plotly_chart(style(fig, "Units / day", 360), width="stretch")
 
-    c_left, c_right = st.columns([1, 1])
-    with c_left:
-        tfig = go.Figure(line(view["date"], view["temp"], "Actual temperature", BLUE, 1.2))
-        tfig.update_xaxes(range=[last_day - pd.Timedelta(days=365), last_day])
-        st.plotly_chart(style(tfig, "External factor: temperature", "°C", 260), width="stretch")
-    with c_right:
-        hist = w.iloc[:len(obs)]
-        drivers = pd.DataFrame([
-            ("Trend", "+15 %/year growth", hist["f_trend"]),
-            ("Annual season", "±20 %, peak late Oct (festive)", hist["f_annual"]),
-            ("Day of week", "Mon 0.90 … Sat 1.25", hist["f_weekly"]),
-            ("Promotion", "1 + 2 × discount", hist["f_promo"]),
-            ("Post-promo dip", "−12 % for 3 days after", hist["f_post_promo"]),
-            ("Holiday", "+35 % on the day", hist["f_holiday"]),
-            ("Temperature", "+1 % per °C above 27 °C", hist["f_temp"]),
-        ], columns=["Driver", "Rule", "f"])
-        drivers["Range"] = drivers["f"].map(lambda s: f"×{s.min():.2f} – {s.max():.2f}")
-        st.markdown("**How demand is generated**")
-        st.dataframe(drivers[["Driver", "Rule", "Range"]], hide_index=True, width="stretch")
-        st.caption("demand = 100 × product of multipliers, plus noise with sd = 10 % of the level.")
+    with st.expander("Behind the data: how this synthetic demand is generated"):
+        c_left, c_right = st.columns([1, 1])
+        with c_left:
+            hist = w.iloc[:len(obs)]
+            drivers = pd.DataFrame([
+                ("Trend", "+15 %/year growth", hist["f_trend"]),
+                ("Annual season", "±20 %, peak late Oct (festive)", hist["f_annual"]),
+                ("Day of week", "Mon 0.90 … Sat 1.25", hist["f_weekly"]),
+                ("Promotion", "1 + 2 × discount", hist["f_promo"]),
+                ("Post-promo dip", "−12 % for 3 days after", hist["f_post_promo"]),
+                ("Holiday", "+35 % on the day", hist["f_holiday"]),
+                ("Temperature", "+1 % per °C above 27 °C", hist["f_temp"]),
+            ], columns=["Driver", "Rule", "f"])
+            drivers["Range"] = drivers["f"].map(lambda s: f"×{s.min():.2f} – {s.max():.2f}")
+            st.dataframe(drivers[["Driver", "Rule", "Range"]], hide_index=True, width="stretch")
+            st.caption("Demand = 100 × all multipliers, plus random noise of about 10 %. "
+                       "Range = smallest and largest multiplier each driver produced.")
+        with c_right:
+            chart_title("External factor: temperature",
+                        "daily temperature in °C. It peaks in summer (May), not in the festive season.",
+                        "its effect on demand is deliberately small (about +1 % per °C), so it adds little "
+                        "accuracy. That is an honest result: not every external factor matters.")
+            tfig = go.Figure(line(view["date"], view["temp"], "Actual temperature", BLUE, 1.2))
+            tfig.update_xaxes(range=[last_day - pd.Timedelta(days=365), last_day])
+            st.plotly_chart(style(tfig, "°C", 240), width="stretch")
 
     # ---- back-test
-    st.subheader(f"Walk-forward back-test: forecasting {L}-day demand")
-    st.caption("Each point is a forecast made with only the data available on that day. "
-               "The model is retrained every 28 days, as it would be in production.")
+    st.markdown("#### Would the forecast have worked? A 6-month test")
+    chart_title(f"Actual vs forecast {L}-day demand",
+                f"each date on the x-axis is a day a forecast was made, using only data up to that day. "
+                f"Blue is the demand that really followed over the next {L} days, orange is the forecast, gray "
+                "is the simple 28-day average. The model was retrained every 28 days, as it would be in real use.",
+                "orange rises with the promotion peaks before they happen; gray stays flat and misses them.")
     bfig = go.Figure([
-        line(bt["origin"], bt["moving_avg"], "Moving average (28 d)", GRAY, 1.5),
+        line(bt["origin"], bt["moving_avg"], "Simple 28-day average", GRAY, 1.5),
         line(bt["origin"], bt["actual"], f"Actual {L}-day demand", BLUE),
         line(bt["origin"], bt["forecast"], f"{model_name} forecast", ORANGE),
     ])
-    st.plotly_chart(style(bfig, f"Actual vs forecast {L}-day demand (x = forecast date)", "Units", 360),
-                    width="stretch")
+    st.plotly_chart(style(bfig, "Units", 340), width="stretch")
 
     other_name = next(n for n, k in MODELS.items() if k != kind)
     table = pd.DataFrame({
         model_name: m_model,
         other_name: metrics(bt_other["actual"], bt_other["forecast"]),
-        "Moving average (28 d)": m_ma,
-        f"Naïve (last {L} days)": metrics(bt["actual"], bt["naive"]),
+        "Simple 28-day average": m_ma,
+        f"Naïve (repeat last {L} days)": metrics(bt["actual"], bt["naive"]),
     }).T
     c_left, c_right = st.columns([3, 2])
     with c_left:
-        st.markdown("**Accuracy over the back-test** (lower is better)")
+        chart_title("Accuracy of each method (lower is better)",
+                    "WAPE is the headline: total error ÷ total demand. MAPE is the average % error per forecast. "
+                    "Bias above 0 means over-forecasting (extra stock); below 0, under-forecasting (stockouts). "
+                    "RMSE is in units and punishes big misses most.",
+                    "both machine-learning models roughly halve the error of the simple methods, and their bias "
+                    "stays close to zero.")
         st.dataframe(table.style.format("{:.1f}"), width="stretch")
-        st.caption("WAPE = total absolute error ÷ total demand. Bias > 0 means over-forecasting.")
     with c_right:
-        imp = fc["importances"].head(8)[::-1]
-        ifig = go.Figure(go.Bar(x=imp.values, y=imp.index, orientation="h", marker_color=BLUE,
+        chart_title("What the model relies on",
+                    "how much each input helped the model reduce its error during training. Longer bar = "
+                    "relied on more.",
+                    "planned discounts dominate. Treat this as a hint, not proof: related inputs can share credit. "
+                    "The ablation below is the stronger test.")
+        top = imp.head(7)[::-1]
+        ifig = go.Figure(go.Bar(x=top.values, y=top.index, orientation="h", marker_color=BLUE,
                                 hovertemplate="%{y}: %{x:.3f}<extra></extra>"))
         ifig.update_layout(hovermode="closest")
-        st.plotly_chart(style(ifig, "What the model relies on", "", 300), width="stretch")
+        st.plotly_chart(style(ifig, "", 280), width="stretch")
 
-    with st.expander("Which drivers matter? Drop-one feature ablation (about 10 s)"):
-        if st.toggle("Run the ablation on the current data"):
-            sets = {"All features": tuple(ALL_GROUPS)}
-            sets |= {f"Without {g}": tuple(x for x in ALL_GROUPS if x != g) for g in ALL_GROUPS[1:]}
+    with st.expander("Which drivers really matter? Remove one at a time (about 10 s)"):
+        st.caption("The model is re-tested with one group of inputs taken away. The bigger the error jump, "
+                   "the more that group is worth. Recent-demand inputs are always kept.")
+        if st.toggle("Run the test on the current data"):
+            sets = {"All inputs": tuple(ALL_GROUPS)}
+            sets |= {f"Without {GROUP_LABELS[g]}": tuple(x for x in ALL_GROUPS if x != g) for g in ALL_GROUPS[1:]}
             res = {k: metrics(*backtest(obs, L, kind, v)[["actual", "forecast"]].T.values)["WAPE %"]
                    for k, v in sets.items()}
             r = pd.Series(res)
             afig = go.Figure(go.Bar(x=r.index, y=r.values, text=[f"{v:.1f} %" for v in r.values],
                                     textposition="outside",
                                     marker_color=[BLUE] + [GRAY] * (len(r) - 1),
-                                    hovertemplate="%{x}: %{y:.2f} % WAPE<extra></extra>"))
+                                    hovertemplate="%{x}: %{y:.2f} % error<extra></extra>"))
             afig.update_layout(hovermode="closest")
             afig.update_yaxes(range=[0, r.max() * 1.2])
-            st.plotly_chart(style(afig, "Back-test WAPE when one driver group is removed", "WAPE %", 320),
-                            width="stretch")
-            st.caption("The bigger the jump from 'All features', the more that driver group is worth. "
-                       "Lag features are always kept.")
+            st.plotly_chart(style(afig, "Error (WAPE %)", 300), width="stretch")
 
-    st.subheader("Forecast log: continuous updating")
-    st.caption("Every time new data arrives (sidebar), the model retrains and a new forecast is logged. "
-               "Once its window has passed, the actual demand is filled in.")
+    # ---- forecast log
+    st.markdown("#### Keeping the forecast up to date")
+    chart_title("Forecast log",
+                "each row is a forecast made on that date. Once its window has passed, the actual demand is "
+                "filled in and checked against the forecast's likely range.",
+                "press +7 d in the sidebar a few times: the model retrains each time, and about 8 in 10 actuals "
+                "should land inside the range. Far fewer would mean the model is over-confident.")
     d = obs.set_index("date")["demand"]
     rows = []
     for origin, (pt, lo, hi) in sorted(log.items(), reverse=True):
@@ -302,20 +385,26 @@ with tab1:
         known = end <= last_day
         actual = d.loc[origin + pd.Timedelta(days=1):end].sum() if known else None
         rows.append({"Forecast made": origin.date(), "Window": f"{origin + pd.Timedelta(days=1):%d %b} – {end:%d %b}",
-                     "Forecast": f"{pt:,.0f}", "80 % range": f"{lo:,.0f} – {hi:,.0f}",
+                     "Forecast": f"{pt:,.0f}", "Likely range": f"{lo:,.0f} – {hi:,.0f}",
                      "Actual": f"{actual:,.0f}" if known else "—",
                      "Error %": f"{(pt - actual) / actual * 100:+.1f}" if known else "—",
                      "Inside range": ("✅ yes" if lo <= actual <= hi else "❌ no") if known else "pending"})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    if len(rows) == 1:
-        st.caption("Press **+7 d** in the sidebar a few times to watch forecasts get scored.")
+    st.caption("**Next → tab ②:** the forecast is never perfect. How much extra stock covers its errors?")
 
-# ================================================================= TAB 2 / 3 (next steps)
+# ================================================================= TAB 2
 with tab2:
     days, p = lead_time_pmf(L, sigma_L_in, shape)
     L_mean, sigma_L = pmf_moments(days, p)          # moments of the whole-day distribution actually used
-    target = st.slider("Target cycle service level", 80.0, 99.5, 95.0, 0.5, format="%.1f %%",
-                       help="Probability of not running out between placing an order and receiving it.") / 100
+
+    st.markdown("#### How much safety stock do we need, and does it really work?")
+    using_sidebar(f"world {seed}", model_name, lead_desc)
+    takeaway2 = st.container()
+
+    with tab_settings_box():
+        target = st.slider("Target service level", 80.0, 99.5, 95.0, 0.5, format="%.1f %%",
+                           help="Chance of not running out between placing an order and receiving it "
+                                "(cycle service level). Higher = more safety stock.") / 100
     z = norm.ppf(target)
 
     rel_all = (bt_full["actual"] / bt_full["forecast"] - 1).to_numpy()
@@ -327,54 +416,95 @@ with tab2:
     cl = analytic(z, d_cl, s_cl, L_mean, sigma_L)
     formula_cover = float((ltd <= ai_f["rop"]).mean())
 
-    st.subheader("Today's recommendation")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Reorder point (AI + Monte Carlo)", f"{ai_mc['rop']:,.0f} units",
-              help="Place an order when on-hand + on-order inventory falls to this level.")
-    k2.metric("of which safety stock", f"{ai_mc['ss']:,.0f} units",
-              help="Reorder point minus expected demand during the average lead time.")
-    k3.metric("Classic reorder point", f"{cl['rop']:,.0f} units",
-              delta=f"{cl['rop'] - ai_mc['rop']:+,.0f} vs AI", delta_color="off")
-    k4.metric("Real protection of the AI formula", f"{formula_cover * 100:.1f} %",
-              delta=f"{(formula_cover - target) * 100:+.1f} pts vs target",
-              help="Share of Monte Carlo scenarios the formula's reorder point would have covered.")
-    st.caption(f"For an order placed on {last_day:%d %b %Y}. Lead time: average {L_mean:.1f} days, "
-               f"σL {sigma_L:.2f} days, {shape_label.lower()}.")
+    demand_all = pd.concat([obs.set_index("date")["demand"], w.iloc[len(obs):].set_index("date")["demand"]])
+    csl_grid = tuple(sorted({0.80, 0.85, 0.90, 0.925, 0.95, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999,
+                             round(target, 4)}))
+    front = ss_backtest(demand_all, bt_full, L, sigma_L_in, shape, csl_grid)
+    at_t = front[np.isclose(front["csl"], target)].set_index("method")
 
-    # ---- the formula with today's numbers
-    st.subheader("The formula, with today's numbers")
-    st.markdown(r"$SS = Z\cdot\sqrt{\sigma_D^2\cdot \bar L + \bar D^2\cdot\sigma_L^2}$,  "
-                r"$\;ROP = \bar D\cdot\bar L + SS$,  "
-                f"with Z = {z:.3f} for {target * 100:.1f} % service.")
-    c_left, c_right = st.columns(2)
-    for col, name, res, note in [
-        (c_left, "Classic inputs", cl, f"D̄ = average of the last 28 days; σD = spread of the last 90 days of daily "
-                                      "demand, including predictable swings (weekdays, promotions)."),
-        (c_right, "AI inputs", ai_f, f"D̄ = forecast for the next {L} days ÷ {L} (knows about planned promotions); "
-                                    "σD from the model's past errors, so only unpredictable demand is buffered."),
-    ]:
-        with col:
-            st.markdown(f"**{name}**")
-            st.latex(rf"SS = {z:.2f}\sqrt{{{res['sigma_d']:.1f}^2\cdot{L_mean:.1f} + "
-                     rf"{res['d_bar']:.1f}^2\cdot{sigma_L:.2f}^2}} = {res['ss']:,.0f}")
-            st.caption(note)
-    parts = pd.DataFrame({
-        "Demand uncertainty  σD·√L̄": [cl["sigma_d"] * np.sqrt(L_mean), ai_f["sigma_d"] * np.sqrt(L_mean)],
-        "Lead-time uncertainty  D̄·σL": [cl["d_bar"] * sigma_L, ai_f["d_bar"] * sigma_L],
-    }, index=["Classic", "AI"])
-    st.markdown("**Where the buffer comes from** (units, before multiplying by Z; combined as √(a² + b²))")
-    st.dataframe(parts.style.format("{:,.0f}"), width="stretch")
-    if sigma_L > 0 and (parts.iloc[1, 1] > parts.iloc[1, 0]):
-        st.caption("Lead-time uncertainty is the bigger part here, so a better forecast can only shrink "
-                   "the buffer a little. Lower σL in the sidebar to see the forecast's value grow.")
+    def ss_needed(label: str):
+        f = front[front["method"] == label].sort_values("csl")
+        svc, s = f["Achieved service %"].to_numpy() / 100, f["Avg safety stock"].to_numpy()
+        return None if svc.max() < target else float(np.interp(target, np.maximum.accumulate(svc), s))
+
+    summary = at_t[["Avg safety stock", "Avg reorder point", "Achieved service %"]].rename_axis("Method").copy()
+    summary["Safety stock needed to truly hit target"] = [ss_needed(m) for m in summary.index]
+    need = summary["Safety stock needed to truly hit target"]
+    need_cl = need[METHODS["classic"]] if pd.notna(need[METHODS["classic"]]) else None
+    need_ai = need[METHODS["ai_mc"]] if pd.notna(need[METHODS["ai_mc"]]) else None
+    svc_cl = at_t.loc[METHODS["classic"], "Achieved service %"]
+    svc_ai = at_t.loc[METHODS["ai_mc"], "Achieved service %"]
+
+    msg = (f"**Key takeaway:** reorder when stock falls to **{ai_mc['rop']:,.0f} units** (of which "
+           f"{ai_mc['ss']:,.0f} is safety stock). Over the last 6 months, the classic method promised "
+           f"{target * 100:.1f} % but delivered **{svc_cl:.1f} %**; the AI method delivered **{svc_ai:.1f} %**.")
+    if need_cl is not None and need_ai is not None:
+        msg += (f" To truly reach the target, AI needs **{(1 - need_ai / need_cl) * 100:.0f} % less safety "
+                "stock** than the classic method.")
+    elif need_ai is not None:
+        msg += " The classic method could not reach the target at all."
+    else:
+        msg += " Neither method fully reaches a target this high; try a lower one."
+    takeaway2.info(msg)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Reorder point today", f"{ai_mc['rop']:,.0f} units",
+              help=f"Place an order when stock on hand + already on order falls to this level. AI forecast + "
+                   f"Monte Carlo, for an order placed on {last_day:%d %b %Y}.")
+    k2.metric("of which safety stock", f"{ai_mc['ss']:,.0f} units",
+              help="The buffer above expected demand during the lead time. It covers forecast errors and "
+                   "late deliveries.")
+    k3.metric("Classic method would say", f"{cl['rop']:,.0f} units",
+              delta=f"{cl['rop'] - ai_mc['rop']:+,.0f} vs AI", delta_color="off",
+              help="Textbook formula with a 28-day average and the raw spread of daily demand. It does not "
+                   "know about upcoming promotions.")
+    k4.metric("Formula's real protection", f"{formula_cover * 100:.1f} %",
+              delta=f"{(formula_cover - target) * 100:+.1f} pts vs target",
+              help="If you used the textbook formula (with AI inputs), this is the share of simulated scenarios "
+                   "it would really cover. Below target = it under-protects, usually because delays are skewed.")
+
+    with st.expander("Show the math: the formula with today's numbers"):
+        st.markdown(r"$SS = Z\cdot\sqrt{\sigma_D^2\cdot \bar L + \bar D^2\cdot\sigma_L^2}$,  "
+                    r"$\;ROP = \bar D\cdot\bar L + SS$,  "
+                    f"with Z = {z:.3f} for {target * 100:.1f} % service.")
+        c_left, c_right = st.columns(2)
+        for col, name, r_, note in [
+            (c_left, "Classic inputs", cl, "D̄ = average of the last 28 days; σD = spread of the last 90 days of daily "
+                                         "demand, including predictable swings (weekdays, promotions)."),
+            (c_right, "AI inputs", ai_f, f"D̄ = forecast for the next {L} days ÷ {L} (knows about planned "
+                                       "promotions); σD from the model's past errors, so only the unpredictable "
+                                       "part of demand is buffered."),
+        ]:
+            with col:
+                st.markdown(f"**{name}**")
+                st.latex(rf"SS = {z:.2f}\sqrt{{{r_['sigma_d']:.1f}^2\cdot{L_mean:.1f} + "
+                         rf"{r_['d_bar']:.1f}^2\cdot{sigma_L:.2f}^2}} = {r_['ss']:,.0f}")
+                st.caption(note)
+        parts = pd.DataFrame({
+            "From demand uncertainty  σD·√L̄": [cl["sigma_d"] * np.sqrt(L_mean), ai_f["sigma_d"] * np.sqrt(L_mean)],
+            "From lead-time uncertainty  D̄·σL": [cl["d_bar"] * sigma_L, ai_f["d_bar"] * sigma_L],
+        }, index=["Classic", "AI"])
+        chart_title("Where the buffer comes from (units, before × Z)",
+                    "the formula combines two sources of risk as √(a² + b²): uncertain demand and uncertain "
+                    "delivery time.",
+                    "the AI forecast shrinks the demand part. If the lead-time part is much bigger, a better "
+                    "forecast can only help a little: lower the lead-time variability in the sidebar to see the "
+                    "forecast's value grow.")
+        st.dataframe(parts.style.format("{:,.0f}"), width="stretch")
 
     # ---- Monte Carlo
-    st.subheader("Monte Carlo: 20,000 possible lead-time scenarios")
+    st.markdown("#### Simulating 20,000 possible futures")
     c_left, c_right = st.columns([2, 1])
     with c_left:
+        chart_title("Demand while waiting for a delivery",
+                    "each bar counts scenarios with that much demand between ordering and receiving stock. Each "
+                    "scenario combines a random delivery time with one of the model's real past errors. Gray = "
+                    "average, green = formula's reorder point, orange = Monte Carlo reorder point (covers "
+                    f"{target * 100:.1f} % of scenarios).",
+                    "the long right tail comes from late deliveries. The formula assumes a symmetric bell curve, "
+                    "so it sits too low. The bumps are whole-day lead times (4, 5, 6 days…).")
         hfig = go.Figure(go.Histogram(x=ltd, nbinsx=80, marker_color=BLUE, opacity=0.85, name="Scenarios",
                                       hovertemplate="%{x} units: %{y} scenarios<extra></extra>"))
-        # labels at different heights; the formula label sits left of its line so it never meets the MC one
         mc_right = ai_mc["rop"] >= ai_f["rop"]
         for x, label, color, y, side in [(d_ai * L_mean, "Expected", GRAY, 1.0, "left"),
                                          (ai_f["rop"], "Formula ROP", AQUA, 0.84, "right" if mc_right else "left"),
@@ -382,58 +512,40 @@ with tab2:
             hfig.add_vline(x=x, line_color=color, line_width=2)
             hfig.add_annotation(x=x, y=y, yref="paper", text=f"{label}<br>{x:,.0f}", showarrow=False,
                                 xanchor=side, yanchor="top", xshift=4 if side == "left" else -4,
-                                font=dict(size=11), bgcolor="rgba(255,255,255,0.7)")
+                                font=dict(size=11))   # no box: a fixed white box is unreadable in dark mode
         hfig.update_layout(hovermode="closest", showlegend=False, bargap=0.05)
-        st.plotly_chart(style(hfig, "Demand during the lead time", "Scenarios", 340), width="stretch")
-        st.caption(f"Each scenario draws a lead time and one of the model's past forecast errors. The Monte Carlo "
-                   f"reorder point is the {target * 100:.1f}th percentile, so it covers that share of scenarios "
-                   "whatever the distribution's shape. The bumps are whole-day lead times (4, 5, 6 days...).")
+        st.plotly_chart(style(hfig, "Scenarios", 320), width="stretch")
     with c_right:
+        chart_title("Delivery time",
+                    "chance that a delivery takes each number of days. Set by the lead-time settings in the sidebar.",
+                    "with right-skewed delays, very late deliveries (the right tail) are possible while very early "
+                    "ones are not.")
         lfig = go.Figure(go.Bar(x=days, y=p * 100, marker_color=BLUE, name="Lead time",
                                 hovertemplate="%{x} days: %{y:.1f} %<extra></extra>"))
         lfig.update_layout(hovermode="closest", showlegend=False)
         lfig.update_xaxes(title="Days", dtick=1 if days.max() <= 16 else 2)
-        st.plotly_chart(style(lfig, "Lead-time distribution", "Probability %", 340), width="stretch")
+        st.plotly_chart(style(lfig, "Probability %", 320), width="stretch")
 
     # ---- honest check over the last 6 months
-    st.subheader("Did it work? Six months of daily decisions, checked against actual demand")
-    st.caption("Every day the reorder point is recomputed with only the information available that day, then "
-               "scored on the demand that really followed, averaged over the lead-time distribution.")
-    demand_all = pd.concat([obs.set_index("date")["demand"],
-                            w.iloc[len(obs):].set_index("date")["demand"]])
-    grid = (0.80, 0.85, 0.90, 0.925, 0.95, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999)
-    grid = tuple(sorted(set(grid) | {round(target, 4)}))
-    front = ss_backtest(demand_all, bt_full, L, sigma_L_in, shape, grid)
-    at_t = front[np.isclose(front["csl"], target)].set_index("method")
-
-    def ss_needed(label: str):
-        f = front[front["method"] == label].sort_values("csl")
-        svc, ss = f["Achieved service %"].to_numpy() / 100, f["Avg safety stock"].to_numpy()
-        if svc.max() < target:
-            return None
-        return float(np.interp(target, np.maximum.accumulate(svc), ss))
-
-    summary = at_t[["Avg safety stock", "Avg reorder point", "Achieved service %"]].rename_axis("Method").copy()
-    summary["SS needed to truly reach target"] = [ss_needed(m) for m in summary.index]
-    need = summary["SS needed to truly reach target"]
-    need_cl = need[METHODS["classic"]] if pd.notna(need[METHODS["classic"]]) else None
-    need_ai = need[METHODS["ai_mc"]] if pd.notna(need[METHODS["ai_mc"]]) else None
+    st.markdown("#### Did it work? 6 months of daily decisions, checked against real demand")
+    chart_title("Promised vs delivered",
+                "every day for 6 months, each method set a reorder point using only what was known that day. "
+                "Achieved service is how often that would really have avoided a stockout, given the demand that "
+                "followed. The last column is the safety stock each method needs to truly hit the target.",
+                "the classic method under-delivers because it reacts to promotions only after they happen. "
+                "AI + Monte Carlo lands on target.")
     st.dataframe(summary.style.format({"Avg safety stock": "{:,.0f}", "Avg reorder point": "{:,.0f}",
                                        "Achieved service %": "{:.1f}",
-                                       "SS needed to truly reach target": "{:,.0f}"}, na_rep="not reachable"),
-                 width="stretch")
-    if need_ai is not None and need_cl is not None:
-        st.success(f"To really deliver {target * 100:.1f} % service, the classic method needs about "
-                   f"{need_cl:,.0f} units of safety stock; AI + Monte Carlo needs {need_ai:,.0f} "
-                   f"({(need_ai / need_cl - 1) * 100:+.0f} %).")
-    elif need_ai is not None:
-        st.success(f"The classic method could not reach {target * 100:.1f} % in practice at any tested setting; "
-                   f"AI + Monte Carlo does it with about {need_ai:,.0f} units.")
-    else:
-        st.warning(f"Neither method reached {target * 100:.1f} % in practice at any tested setting.")
+                                       "Safety stock needed to truly hit target": "{:,.0f}"},
+                                      na_rep="not reachable"), width="stretch")
 
     c_left, c_right = st.columns(2)
     with c_left:
+        chart_title("Service bought per unit of safety stock",
+                    "each dot is one service-level setting. Across = average stock held, up = service actually "
+                    "achieved. Higher and further left is better.",
+                    "the AI curves sit above the classic one: the same service with less stock. The two AI curves "
+                    "overlap, so the formula is not wasteful, just mis-calibrated: it lands below the target.")
         ffig = go.Figure()
         for key, color in [("classic", GRAY), ("ai_formula", AQUA), ("ai_mc", ORANGE)]:
             f = front[front["method"] == METHODS[key]].sort_values("csl")
@@ -441,54 +553,69 @@ with tab2:
                                       mode="lines+markers", line=dict(color=color, width=2),
                                       marker=dict(size=8, line=dict(color="white", width=1)),
                                       customdata=f["csl"] * 100,
-                                      hovertemplate="SS %{x:,.0f} → %{y:.1f} % achieved"
+                                      hovertemplate="stock %{x:,.0f} → %{y:.1f} % achieved"
                                                     "<br>(asked for %{customdata:.1f} %)<extra></extra>"))
         ffig.add_hline(y=target * 100, line_color=GRAY, line_width=1,
                        annotation_text=f"target {target * 100:.1f} %", annotation_position="bottom right")
         ffig.update_layout(hovermode="closest")
         ffig.update_xaxes(title="Average safety stock (units)")
-        st.plotly_chart(style(ffig, "Service bought per unit of safety stock (up and left is better)",
-                              "Achieved service %", 380), width="stretch")
+        st.plotly_chart(style(ffig, "Achieved service %", 360), width="stretch")
     with c_right:
+        chart_title("Reorder point over time",
+                    f"blue is the demand that actually followed over the next {round(L_mean)} days; the lines are "
+                    "each method's reorder point on that day. When blue gets close to a line, that method was at "
+                    "risk of running out.",
+                    "the AI reorder point rises before the promotion peaks; the classic one only drifts upward "
+                    "afterwards.")
         tl = ss_timeline(demand_all, bt_full, L, sigma_L_in, shape, target)
         d_series = demand_all.to_numpy(float)
         idx = pd.Index(demand_all.index)
-        k = int(round(L_mean))
-        act = [d_series[idx.get_loc(t) + 1: idx.get_loc(t) + 1 + k].sum() for t in tl["origin"]]
+        kk = int(round(L_mean))
+        act = [d_series[idx.get_loc(t) + 1: idx.get_loc(t) + 1 + kk].sum() for t in tl["origin"]]
         tfig = go.Figure([
-            line(tl["origin"], act, f"Actual {k}-day demand", BLUE, 1.5),
-            line(tl["origin"], tl["rop_classic"], "Classic ROP", GRAY),
-            line(tl["origin"], tl["rop_ai_mc"], "AI ROP", ORANGE),
+            line(tl["origin"], act, f"Actual {kk}-day demand", BLUE, 1.5),
+            line(tl["origin"], tl["rop_classic"], "Classic", GRAY),
+            line(tl["origin"], tl["rop_ai_mc"], "AI + Monte Carlo", ORANGE),
         ])
-        st.plotly_chart(style(tfig, "Reorder point over time vs demand that followed", "Units", 380),
-                        width="stretch")
-    st.caption("Left: each point is one nominal service level; the AI curve reaching higher service with less "
-               "stock is the value of the forecast. The two AI curves overlap: the formula is not less efficient, "
-               "it is mis-calibrated, landing below the target because it assumes a normal lead time. "
-               "Right: the classic reorder point reacts to promotions only after they happen, while the AI one "
-               "rises before them.")
+        st.plotly_chart(style(tfig, "Units", 360), width="stretch")
+    st.caption("**Next → tab ③:** we fixed the service level here. What if we let costs decide both when and "
+               "how much to order?")
+
+# ================================================================= TAB 3
 with tab3:
-    st.caption("Six months of daily inventory are simulated with the actual demand and 20 random lead-time "
-               "scenarios. Each candidate (reorder point, order quantity) gets a daily cost; the optimizer looks "
-               "for the cheapest one that still meets the service constraint.")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        policy_label = st.radio("Reorder-point policy", ["AI dynamic", "Static"], horizontal=True,
-                                help="AI dynamic: R moves daily = forecast lead-time demand + k × its uncertainty. "
-                                     "Static: one fixed R for the whole period.")
-        policy = "dynamic" if policy_label == "AI dynamic" else "static"
-        budget = st.slider("Evaluation budget (simulations)", 20, 150, 60, 5,
-                           help="How many candidate policies each method may simulate.")
-    with c2:
-        service_label = st.radio("Service constraint", ["Fill rate", "Cycle service level"], horizontal=True,
-                                 help="Fill rate: share of demand served from stock. Cycle service level: share of "
-                                      "orders with no stockout while they were on the way.")
-        service = "fill_rate" if service_label == "Fill rate" else "csl"
-        svc_target = st.slider("Must be at least", 80.0, 99.5, 95.0, 0.5, format="%.1f %%") / 100
-    with c3:
-        h_cost = st.number_input("Holding cost (₹ per unit per day)", 0.01, 5.0, 0.10, 0.01, format="%.2f")
-        p_cost = st.number_input("Lost-sale penalty (₹ per unit)", 0.0, 500.0, 20.0, 1.0)
-        o_cost = st.number_input("Ordering cost (₹ per order)", 0.0, 20_000.0, 1_000.0, 100.0)
+    st.markdown("#### What is the cheapest policy that still keeps customers served?")
+    using_sidebar(f"world {seed}", model_name, lead_desc)
+    takeaway3 = st.container()
+
+    with tab_settings_box():
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            policy_label = st.radio("Reorder-point policy", ["AI dynamic", "Static"], horizontal=True,
+                                    help="AI dynamic: the reorder point moves every day with the forecast "
+                                         "(expected demand + k × its uncertainty). Static: one fixed number "
+                                         "for the whole 6 months.")
+            policy = "dynamic" if policy_label == "AI dynamic" else "static"
+            budget = st.slider("Simulations allowed", 20, 150, 60, 5,
+                               help="How many candidate policies each search method may try. Each one is a full "
+                                    "6-month inventory simulation.")
+        with c2:
+            service_label = st.radio("Service rule", ["Fill rate", "Cycle service level"], horizontal=True,
+                                     help="Fill rate: share of customer demand served from stock. Cycle service "
+                                          "level: share of orders with no stockout while they were on the way.")
+            service = "fill_rate" if service_label == "Fill rate" else "csl"
+            svc_target = st.slider("Must be at least", 80.0, 99.5, 95.0, 0.5, format="%.1f %%",
+                                   help="Policies below this are rejected, however cheap.") / 100
+        with c3:
+            h_cost = st.number_input("Holding cost (₹ per unit per day)", 0.01, 5.0, 0.10, 0.01, format="%.2f",
+                                     help="Cost of keeping one unit on the shelf for a day (capital, space, "
+                                          "spoilage). ₹0.10 ≈ 36 % a year on a ₹100 item.")
+            p_cost = st.number_input("Lost-sale penalty (₹ per unit)", 0.0, 500.0, 20.0, 1.0,
+                                     help="Lost margin and goodwill when a customer finds the shelf empty.")
+            o_cost = st.number_input("Ordering cost (₹ per order)", 0.0, 20_000.0, 1_000.0, 100.0,
+                                     help="Fixed cost of each order (transport, handling, admin). This is what "
+                                          "makes ordering in bigger batches worthwhile.")
+    st.caption("Each candidate (reorder point, order quantity) is tested by simulating 6 months of daily inventory "
+               "with the real demand and 20 random delivery-time scenarios.")
 
     tl3 = ss_timeline(demand_all, bt_full, L, sigma_L_in, shape, target)
     mu_t = (tl3["rop_ai_formula"] - tl3["ss_ai_formula"]).to_numpy()
@@ -501,68 +628,82 @@ with tab3:
     n1, n2 = res["names"]
     bo, grid, full = res["bo"], res["grid"], res["full"]
     b_bo, b_grid, b_full = best_feasible(bo), best_feasible(grid), best_feasible(full)
+    b_other = best_feasible(other["bo"])
 
     if b_bo is None:
-        st.warning("No simulated policy met the service constraint. Lower the target or widen the costs.")
+        takeaway3.warning("No simulated policy met the service rule. Lower the target or change the costs.")
     else:
         mu_today, sig_today = d_ai * L_mean, ai_f["ss"] / z
         r_today = b_bo["R"] if policy == "static" else mu_today + b_bo["k"] * sig_today
-        st.subheader("Best policy found by Bayesian optimization")
+        q_days = b_bo["Q"] / dem_t.mean()
+        gap = (b_bo["cost"] / b_full["cost"] - 1) * 100 if b_full is not None else np.nan
+        msg = (f"**Key takeaway:** reorder at **{r_today:,.0f} units** and order **{b_bo['Q']:,.0f} units** "
+               f"each time (about {q_days:.0f} days of demand). Cost: **₹{b_bo['cost']:,.0f} a day** with "
+               f"{b_bo['service'] * 100:.1f} % {service_label.lower()}. Bayesian optimization found this in "
+               f"{len(bo)} simulations, {gap:+.1f} % from the best of a 1,600-simulation brute-force search.")
+        if b_other is not None:
+            pol = {policy: b_bo, ("static" if policy == "dynamic" else "dynamic"): b_other}
+            saving = 1 - pol["dynamic"]["cost"] / pol["static"]["cost"]
+            msg += (f" Letting the reorder point follow the AI forecast is **{abs(saving) * 100:.1f} % "
+                    f"{'cheaper' if saving >= 0 else 'more expensive'}** than keeping it fixed.")
+        takeaway3.info(msg)
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Reorder point today", f"{r_today:,.0f} units",
-                  help="Static: the fixed R. AI dynamic: today's forecast lead-time demand + k × uncertainty.")
-        k2.metric("Order quantity Q", f"{b_bo['Q']:,.0f} units",
-                  help=f"About {b_bo['Q'] / dem_t.mean():.1f} days of average demand; "
+                  help="Order when stock on hand + on order falls to this. Static: one fixed number. "
+                       "AI dynamic: today's forecast of lead-time demand + k × its uncertainty.")
+        k2.metric("Order quantity", f"{b_bo['Q']:,.0f} units",
+                  help=f"How much to order each time: about {q_days:.1f} days of average demand, "
                        f"{b_bo['orders_per_month']:.1f} orders a month.")
-        k3.metric("Average daily cost", f"₹{b_bo['cost']:,.0f}")
+        k3.metric("Average daily cost", f"₹{b_bo['cost']:,.0f}",
+                  help=f"Holding ₹{b_bo['holding']:,.0f} + lost sales ₹{b_bo['stockout']:,.0f} + "
+                       f"ordering ₹{b_bo['ordering']:,.0f} per day.")
         k4.metric(f"Achieved {service_label.lower()}", f"{b_bo['service'] * 100:.1f} %",
-                  delta=f"{(b_bo['service'] - svc_target) * 100:+.1f} pts vs constraint", delta_color="off")
-        if policy == "dynamic":
-            st.caption(f"Optimal k = {b_bo['k']:.2f}, against Z = {z:.2f} from the textbook formula for "
-                       f"{target * 100:.1f} % (tab 2). The optimizer balances costs directly instead of fixing "
-                       "a service level first.")
-        binding = b_bo["service"] - svc_target < 0.005
-        st.caption("The service constraint is **binding**: without it, the cheapest policy would serve fewer "
-                   "customers." if binding else
-                   "The constraint is **not binding**: with these costs, losing a sale is expensive enough that "
-                   "the cheapest policy already exceeds the target. Lower the lost-sale penalty to see it bind.")
+                  delta=f"{(b_bo['service'] - svc_target) * 100:+.1f} pts vs rule", delta_color="off",
+                  help="Above the rule by a lot = the rule is not what limits the policy; costs are.")
+        notes = []
+        if policy == "dynamic" and service == "csl":
+            notes.append(f"Optimal safety factor k = {b_bo['k']:.2f}; the textbook formula would use "
+                         f"Z = {norm.ppf(svc_target):.2f} for a {svc_target * 100:.1f} % cycle service level. "
+                         "The optimizer weighs costs directly instead.")
+        elif policy == "dynamic":
+            notes.append(f"Optimal safety factor k = {b_bo['k']:.2f}: the buffer is {b_bo['k']:.2f} × the "
+                         "forecast's uncertainty during the lead time.")
+        if b_bo["service"] - svc_target < 0.005:
+            notes.append("The service rule is **binding**: without it, the cheapest policy would serve fewer "
+                         "customers.")
+        else:
+            notes.append("The service rule is **not binding**: a lost sale is expensive enough that the cheapest "
+                         "policy already beats the target. Lower the lost-sale penalty to see it bind.")
+        st.caption(" ".join(notes))
 
         # ---- method comparison
-        st.subheader("Bayesian optimization vs grid sweep")
+        st.markdown("#### How the best policy was found: Bayesian optimization vs grid search")
         n_side = int(round(np.sqrt(budget)))
-
-        def row(name, evals, b):
-            if b is None:
-                return {"Method": name, "Simulations": evals}
-            return {"Method": name, "Simulations": evals, n1: b[n1], "Q": b["Q"], "Daily cost ₹": b["cost"],
-                    "Gap vs brute force": (b["cost"] / b_full["cost"] - 1) * 100 if b_full is not None else np.nan,
-                    "Service %": b["service"] * 100, "Holding ₹": b["holding"], "Lost sales ₹": b["stockout"],
-                    "Ordering ₹": b["ordering"]}
-
-        comp = pd.DataFrame([row("Bayesian optimization (Optuna TPE)", len(bo), b_bo),
-                             row(f"Grid sweep, same budget ({n_side}×{n_side})", len(grid), b_grid),
-                             row("Brute-force grid (40×40, reference)", len(full), b_full)]).set_index("Method")
-        fmt = {n1: "{:,.2f}" if n1 == "k" else "{:,.0f}", "Q": "{:,.0f}", "Daily cost ₹": "{:,.1f}",
-               "Gap vs brute force": "{:+.1f} %", "Service %": "{:.1f}", "Holding ₹": "{:,.0f}",
-               "Lost sales ₹": "{:,.0f}", "Ordering ₹": "{:,.0f}"}
-        st.dataframe(comp.style.format(fmt, na_rep="none feasible"), width="stretch")
-
         c_left, c_right = st.columns([3, 2])
         with c_left:
-            g1 = np.linspace(*res["bounds"][0], 40)
-            g2 = np.linspace(*res["bounds"][1], 40)
+            chart_title("Cost map: every combination at once",
+                        "each cell is the daily cost of one combination of reorder point (across) and order "
+                        "quantity (up). Darker = more expensive; light gray = breaks the service rule. Gray "
+                        "squares are where the grid search looked, orange dots where Bayesian optimization "
+                        "looked, and the star is its best.",
+                        "this map replaces one-at-a-time sensitivity sweeps. Bayesian trials start scattered, "
+                        "then gather in the cheap (light) valley; the grid spends most of its runs in expensive "
+                        "areas.")
+            g1_ = np.linspace(*res["bounds"][0], 40)
+            g2_ = np.linspace(*res["bounds"][1], 40)
             cost = full["cost"].to_numpy().reshape(40, 40).T          # rows = Q, cols = x1
             feas = full["feasible"].to_numpy().reshape(40, 40).T
             ramp = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
             hm = go.Figure()
-            hm.add_trace(go.Heatmap(x=g1, y=g2, z=np.where(feas, np.nan, 1), showscale=False, hoverinfo="skip",
-                                    colorscale=[[0, "#e1e0d9"], [1, "#e1e0d9"]], name="Fails constraint"))
-            hm.add_trace(go.Heatmap(x=g1, y=g2, z=np.where(feas, cost, np.nan), colorscale=ramp,
+            hm.add_trace(go.Heatmap(x=g1_, y=g2_, z=np.where(feas, np.nan, 1), showscale=False, hoverinfo="skip",
+                                    colorscale=[[0, "#e1e0d9"], [1, "#e1e0d9"]], name="Breaks the rule"))
+            hm.add_trace(go.Heatmap(x=g1_, y=g2_, z=np.where(feas, cost, np.nan), colorscale=ramp,
                                     zmin=np.nanmin(np.where(feas, cost, np.nan)),
                                     zmax=np.nanquantile(np.where(feas, cost, np.nan), 0.9),
                                     colorbar=dict(title="₹/day", thickness=12), name="Daily cost",
                                     hovertemplate=f"{n1} %{{x:,.2f}}<br>Q %{{y:,.0f}}<br>₹%{{z:,.1f}}/day<extra></extra>"))
-            hm.add_trace(go.Scatter(x=grid[n1], y=grid["Q"], mode="markers", name=f"Grid ({len(grid)})",
+            hm.add_trace(go.Scatter(x=grid[n1], y=grid["Q"], mode="markers", name=f"Grid search ({len(grid)})",
                                     marker=dict(color=GRAY, size=7, symbol="square",
                                                 line=dict(color="white", width=1))))
             hm.add_trace(go.Scatter(x=bo[n1], y=bo["Q"], mode="markers", name=f"Bayesian trials ({len(bo)})",
@@ -573,57 +714,72 @@ with tab3:
                                     marker=dict(color=ORANGE, size=18, symbol="star",
                                                 line=dict(color="#0b0b0b", width=1.5))))
             hm.update_layout(hovermode="closest")
-            hm.update_xaxes(title="k (safety factor)" if n1 == "k" else "Reorder point R (units)")
-            hm.update_yaxes(title="Order quantity Q (units)")
-            st.plotly_chart(style(hm, "Cost landscape and where each method looked", "Order quantity Q (units)",
-                                  440), width="stretch")
-            st.caption("This map is the sensitivity analysis: every combination at once, instead of one parameter "
-                       "at a time. Darker = more expensive; gray = misses the service constraint. Bayesian trials "
-                       "start scattered, then cluster where cost is low.")
+            hm.update_xaxes(title="Safety factor k" if n1 == "k" else "Reorder point R (units)")
+            st.plotly_chart(style(hm, "Order quantity Q (units)", 420), width="stretch")
         with c_right:
+            chart_title("Best cost found so far",
+                        "after each simulation, the cheapest policy found so far that keeps the service rule. "
+                        "The blue line is the best of a 1,600-simulation brute-force search.",
+                        "how quickly each method gets close to the blue line. The grid only improves when one of "
+                        "its fixed points happens to land near the optimum; Bayesian optimization learns where to "
+                        "try next.")
             cfig = go.Figure([
-                line(np.arange(1, len(grid) + 1), best_so_far(grid), f"Grid sweep ({n_side}×{n_side})", GRAY),
+                line(np.arange(1, len(grid) + 1), best_so_far(grid), f"Grid search ({n_side}×{n_side})", GRAY),
                 line(np.arange(1, len(bo) + 1), best_so_far(bo), "Bayesian optimization", ORANGE),
             ])
             if b_full is not None:
                 cfig.add_hline(y=b_full["cost"], line_color=BLUE, line_width=1,
-                               annotation_text="brute-force best (1,600 runs)", annotation_position="top right")
+                               annotation_text="brute-force best", annotation_position="top right")
             cfig.update_xaxes(title="Simulations run")
-            st.plotly_chart(style(cfig, "Best cost found so far", "₹ per day", 440), width="stretch")
-            st.caption("The grid only gets better when one of its fixed points happens to land near the optimum. "
-                       "Bayesian optimization learns from each result where to try next.")
+            st.plotly_chart(style(cfig, "₹ per day", 420), width="stretch")
 
-        with st.expander("Is Bayesian optimization always better? (what our tests showed)"):
+        def row(name, evals, b):
+            if b is None:
+                return {"Method": name, "Simulations": evals}
+            return {"Method": name, "Simulations": evals, n1: b[n1], "Q": b["Q"], "Daily cost ₹": b["cost"],
+                    "Gap vs brute force": (b["cost"] / b_full["cost"] - 1) * 100 if b_full is not None else np.nan,
+                    "Service %": b["service"] * 100}
+
+        chart_title("Results side by side",
+                    "the best policy each search method found, its daily cost, and how far that is from the "
+                    "brute-force best (0 % = equally good).",
+                    f"Bayesian optimization uses about the same number of simulations as the {n_side}×{n_side} "
+                    "grid, but is usually closer to the brute-force best, which needed 1,600.")
+        comp = pd.DataFrame([row("Bayesian optimization", len(bo), b_bo),
+                             row(f"Grid search ({n_side}×{n_side})", len(grid), b_grid),
+                             row("Brute force (40×40, reference)", len(full), b_full)]).set_index("Method")
+        fmt = {n1: "{:,.2f}" if n1 == "k" else "{:,.0f}", "Q": "{:,.0f}", "Daily cost ₹": "{:,.1f}",
+               "Gap vs brute force": "{:+.1f} %", "Service %": "{:.1f}"}
+        st.dataframe(comp.style.format(fmt, na_rep="none passed"), width="stretch")
+
+        with st.expander("Is Bayesian optimization always better? What our tests showed"):
             st.markdown(
-                "Over 10 random seeds on this problem, with two decision variables:\n\n"
-                "- With an **equal budget**, Bayesian optimization usually got closer to the brute-force optimum "
-                "than a grid, but not always: a lucky grid can land right on the optimum.\n"
-                "- The grid is **erratic**: a 12×12 grid once did worse than a 10×10 one, because its points "
-                "happened to straddle the optimum. Bayesian optimization improved steadily with more trials.\n"
-                "- With 100–150 trials it matched or beat the **1,600-run** brute force, because it is not "
+                "Over 10 random worlds, with two decisions to make (reorder point and order quantity):\n\n"
+                "- With the **same number of simulations**, Bayesian optimization usually got closer to the best "
+                "answer than a grid, but not always: a lucky grid can land right on it.\n"
+                "- The grid is **erratic**: a 12×12 grid once did worse than a 10×10 one. Bayesian optimization "
+                "improved steadily with more trials.\n"
+                "- With 100–150 trials it matched or beat the **1,600-simulation** brute force, because it is not "
                 "limited to fixed grid points.\n"
-                "- Its real advantage grows with the number of variables: a 7-point grid needs 49 runs for 2 "
-                "variables but 343 for 3 and 2,401 for 4.\n\n"
-                "Optuna's TPE sampler is a Bayesian method: it models which settings tend to give low cost and "
-                "samples there, and it treats the service level as a constraint. (Optuna's Gaussian-process "
-                "sampler would need PyTorch, too heavy for this free deployment.)")
+                "- Its advantage grows with more decisions: a 7-point grid needs 49 runs for 2 decisions but "
+                "343 for 3 and 2,401 for 4.\n\n"
+                "The method used is Optuna's TPE sampler: it builds a probability model of which settings tend to "
+                "be cheap and samples there, and it treats the service rule as a constraint.")
 
         # ---- static vs AI dynamic
-        st.subheader("Is the AI-driven reorder point worth it?")
-        b_other = best_feasible(other["bo"])
         if b_other is not None:
-            pol = {policy: b_bo, ("static" if policy == "dynamic" else "dynamic"): b_other}
+            st.markdown("#### Is the AI-driven reorder point worth it?")
+            chart_title("Fixed vs forecast-driven reorder point",
+                        "both policies were tuned by Bayesian optimization under the same costs and service rule. "
+                        "Costs are per day; stock is the average number of units on the shelf.",
+                        "the AI policy holds less stock in quiet weeks and more before promotions. Its saving is "
+                        f"modest here because each order is large (about {pol['dynamic']['Q'] / dem_t.mean():.0f} "
+                        "days of demand), so routine batch stock, not safety stock, is most of the inventory. "
+                        "Lower the ordering cost to see the gap grow.")
             vs = pd.DataFrame({
-                "Static R (fixed for 6 months)": pol["static"], "AI dynamic R (follows the forecast)": pol["dynamic"],
+                "Fixed reorder point": pol["static"], "AI forecast-driven": pol["dynamic"],
             }).T[["cost", "holding", "stockout", "ordering", "avg_on_hand", "service", "orders_per_month"]]
             vs.columns = ["Daily cost ₹", "Holding ₹", "Lost sales ₹", "Ordering ₹", "Avg units on hand",
                           f"{service_label} %", "Orders / month"]
             vs[f"{service_label} %"] *= 100
             st.dataframe(vs.astype(float).style.format("{:,.1f}"), width="stretch")
-            saving = 1 - pol["dynamic"]["cost"] / pol["static"]["cost"]
-            st.caption(f"Both policies tuned by Bayesian optimization under the same constraint. The AI dynamic "
-                       f"policy is {saving * 100:.1f} % {'cheaper' if saving >= 0 else 'more expensive'} per day. "
-                       "Its gain comes from holding less stock in quiet weeks and more before promotions. It stays "
-                       "modest when order quantities are large (here about "
-                       f"{pol['dynamic']['Q'] / dem_t.mean():.0f} days of demand), because then cycle stock, not "
-                       "safety stock, is most of the inventory.")
