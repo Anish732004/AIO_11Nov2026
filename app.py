@@ -1,7 +1,10 @@
 """Reorder Point Lab - AI-driven demand forecasting, safety stock and reorder-point optimization."""
 from __future__ import annotations
 
+import hashlib
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,7 +12,27 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy.stats import norm
 
-from src.data_io import REQUIRED_UPLOAD, validate_new_rows
+# ---------------------------------------------------------------- keep code and cache in step
+# A redeploy (e.g. Streamlit Cloud pulling a new commit) can leave the running server with
+# (a) cached results computed by the previous src/ code - st.cache_data only tracks changes to the
+#     cached function's own body - and (b) the previous src/ modules still imported.
+# Either mismatch can crash the app. Fingerprint src/; when it changes, drop the old modules so the
+# imports below load the new code, and clear every cached result. Runs once per fingerprint.
+SRC_VERSION = hashlib.sha256(b"".join(
+    p.read_bytes() for p in sorted((Path(__file__).parent / "src").glob("*.py")))).hexdigest()[:12]
+
+
+@st.cache_resource(show_spinner=False)
+def _sync_with_code(version: str) -> str:
+    for name in [m for m in sys.modules if m == "src" or m.startswith("src.")]:
+        del sys.modules[name]
+    st.cache_data.clear()
+    return version
+
+
+_sync_with_code(SRC_VERSION)
+
+from src.data_io import REQUIRED_UPLOAD, validate_new_rows  # noqa: E402  (must follow the sync above)
 from src.forecast import ALL_GROUPS, FEATURE_GROUPS, MODELS, forecast_next, metrics, walk_forward
 from src.optimize import Costs, Problem, bayes_opt, best_feasible, best_so_far, grid_search, lead_scenarios
 from src.safety_stock import (METHODS, ai_inputs, analytic, classic_inputs, dynamic_backtest,
@@ -422,18 +445,19 @@ with tab2:
     front = ss_backtest(demand_all, bt_full, L, sigma_L_in, shape, csl_grid)
     at_t = front[np.isclose(front["csl"], target)].set_index("method")
 
-    def ss_needed(label: str):
-        f = front[front["method"] == label].sort_values("csl")
+    def ss_needed(key: str):
+        f = front[front["method"] == key].sort_values("csl")
         svc, s = f["Achieved service %"].to_numpy() / 100, f["Avg safety stock"].to_numpy()
         return None if svc.max() < target else float(np.interp(target, np.maximum.accumulate(svc), s))
 
-    summary = at_t[["Avg safety stock", "Avg reorder point", "Achieved service %"]].rename_axis("Method").copy()
-    summary["Safety stock needed to truly hit target"] = [ss_needed(m) for m in summary.index]
+    # rows are keyed by stable method ids ('classic', 'ai_formula', 'ai_mc'); names are added for display only
+    summary = at_t[["Avg safety stock", "Avg reorder point", "Achieved service %"]].copy()
+    summary["Safety stock needed to truly hit target"] = [ss_needed(k) for k in summary.index]
     need = summary["Safety stock needed to truly hit target"]
-    need_cl = need[METHODS["classic"]] if pd.notna(need[METHODS["classic"]]) else None
-    need_ai = need[METHODS["ai_mc"]] if pd.notna(need[METHODS["ai_mc"]]) else None
-    svc_cl = at_t.loc[METHODS["classic"], "Achieved service %"]
-    svc_ai = at_t.loc[METHODS["ai_mc"], "Achieved service %"]
+    need_cl = need["classic"] if pd.notna(need["classic"]) else None
+    need_ai = need["ai_mc"] if pd.notna(need["ai_mc"]) else None
+    svc_cl = at_t.loc["classic", "Achieved service %"]
+    svc_ai = at_t.loc["ai_mc", "Achieved service %"]
 
     msg = (f"**Key takeaway:** reorder when stock falls to **{ai_mc['rop']:,.0f} units** (of which "
            f"{ai_mc['ss']:,.0f} is safety stock). Over the last 6 months, the classic method promised "
@@ -543,7 +567,8 @@ with tab2:
                 "followed. The last column is the safety stock each method needs to truly hit the target.",
                 "the classic method under-delivers because it reacts to promotions only after they happen. "
                 f"{METHODS['ai_mc']} lands on target.")
-    st.dataframe(summary.style.format({"Avg safety stock": "{:,.0f}", "Avg reorder point": "{:,.0f}",
+    st.dataframe(summary.rename(index=METHODS).rename_axis("Method").style.format({
+                                       "Avg safety stock": "{:,.0f}", "Avg reorder point": "{:,.0f}",
                                        "Achieved service %": "{:.1f}",
                                        "Safety stock needed to truly hit target": "{:,.0f}"},
                                       na_rep="not reachable"), width="stretch")
@@ -557,7 +582,7 @@ with tab2:
                     "overlap, so the formula is not wasteful, just mis-calibrated: it lands below the target.")
         ffig = go.Figure()
         for key, color in [("classic", GRAY), ("ai_formula", AQUA), ("ai_mc", ORANGE)]:
-            f = front[front["method"] == METHODS[key]].sort_values("csl")
+            f = front[front["method"] == key].sort_values("csl")
             ffig.add_trace(go.Scatter(x=f["Avg safety stock"], y=f["Achieved service %"], name=METHODS[key],
                                       mode="lines+markers", line=dict(color=color, width=2),
                                       marker=dict(size=8, line=dict(color="white", width=1)),

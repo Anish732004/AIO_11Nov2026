@@ -148,8 +148,13 @@ METHODS = {"classic": "Classic textbook", "ai_formula": "AI forecast + formula",
 
 
 def summarize(dyn: pd.DataFrame) -> pd.DataFrame:
+    """One row per method, indexed by the stable key ('classic', 'ai_formula', 'ai_mc').
+
+    Display names (METHODS) are applied by the caller, so renaming a method never invalidates
+    results that were computed and cached earlier.
+    """
     return pd.DataFrame({
-        label: {"Avg safety stock": dyn[f"ss_{k}"].mean(),
-                "Avg reorder point": dyn[f"rop_{k}"].mean(),
-                "Achieved service %": dyn[f"svc_{k}"].mean() * 100}
-        for k, label in METHODS.items()}).T
+        k: {"Avg safety stock": dyn[f"ss_{k}"].mean(),
+            "Avg reorder point": dyn[f"rop_{k}"].mean(),
+            "Achieved service %": dyn[f"svc_{k}"].mean() * 100}
+        for k in METHODS}).T
