@@ -1,0 +1,11 @@
+# macOS / Python / local env
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+
+# Course material not part of this project (10 Nov work, PDFs, archives)
+AIO_10Nov2026.ipynb
+10Nov2026_ExecutiveSummary.pdf
+*.zip
+*.pdf
